@@ -98,10 +98,21 @@ export function normalizePerpsMetadataInPlace(target: any): any {
     return target;
 }
 
-function resolveContractKey(contract: string): string | undefined {
+export function resolveContractKey(contract: string): string | undefined {
     const key = contract.toLowerCase();
     if (key in CONTRACT_METADATA) return key;
-    return CONTRACT_ALIAS[key];
+    if (key in CONTRACT_ALIAS) return CONTRACT_ALIAS[key];
+
+    const colonIdx = key.indexOf(":");
+    const afterColon = colonIdx >= 0 ? colonIdx + 1 : 0;
+    const hyphenIdx = key.indexOf("-", afterColon);
+    if (hyphenIdx > afterColon) {
+        const stripped = key.substring(0, hyphenIdx);
+        if (stripped in CONTRACT_METADATA) return stripped;
+        if (stripped in CONTRACT_ALIAS) return CONTRACT_ALIAS[stripped];
+    }
+
+    return undefined;
 }
 
 export function getContractMetadata(contract: string): PerpsContractMetadata | null {
@@ -186,6 +197,11 @@ export async function loadContractMetadataFromAirtable(): Promise<number> {
 
     let count = 0;
     for (const row of rows as any[]) {
+        // Delisted markets must be excluded from the perps pipeline entirely —
+        // by not registering metadata, `hasContractMetadata` returns false and the
+        // market is skipped in both ingest (perps.ts) and output (cron.ts).
+        if (row?.Delisted === true) continue;
+
         const mapped: Record<string, unknown> = {};
         for (const [header, value] of Object.entries(row || {})) {
             const key = headerToKey(String(header));

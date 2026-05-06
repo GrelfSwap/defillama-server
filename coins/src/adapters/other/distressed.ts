@@ -67,6 +67,7 @@ export const contracts: { [chain: string]: { [token: string]: string } } = {
     USPD: "0x476ef9ac6d8673e220d0e8bc0a810c2dc6a2aa84", 
     yTUSD: '0x73a052500105205d34daf004eab301916da8190f',
     DGLD: "0xa9299c296d7830a99414d1e5546f5171fa01e9c8",
+    USDTC: "0x0f6b862e05a9b528b0002261f9eb616e6c4452e9"
   },
   // beam: {
   //   WMC: '0xd51bfa777609213a653a2cd067c9a0132a2d316a'
@@ -116,6 +117,7 @@ export const contracts: { [chain: string]: { [token: string]: string } } = {
     DOGECOLA: "0xe320df552e78d57e95cf1182b6960746d5016561",
     GVR: "0xaFb64E73dEf6fAa8B6Ef9a6fb7312d5C4C15ebDB",
     GVR2: "0xF33893DE6eB6aE9A67442E066aE9aBd228f5290c",
+    BRY: "0xf859Bf77cBe8699013d6Dbc7C2b926Aaf307F830",  // bad token price
     PANCAKE_LP_ABNB_BNB: "0x272c2CF847A49215A3A1D4bFf8760E503A06f880",
     BTCBR: "0x0cf8e180350253271f4b917ccfb0accc4862f262",
     RB: "0x441bb79f2da0daf457bad3d401edb68535fb3faa",
@@ -157,6 +159,7 @@ export const contracts: { [chain: string]: { [token: string]: string } } = {
     NEST: "0x98f8669f6481ebb341b522fcd3663f79a3d1a6a7",
     DOT: "0x8d010bf9c26881788b4e6bf5fd1bdc358c8f90b8", // hacked maybe, has insane supply
     USDS: "0xde7d1ce109236b12809c45b23d22f30dba0ef424", // radioshack inflated tvl
+    USDTC: "0x96fb784986284cb6d4a8da6dd50dd7e85ef38f5d"
   },
   cronos: {
     CRK: "0x065de42e28e42d90c2052a1b49e7f83806af0e1f",

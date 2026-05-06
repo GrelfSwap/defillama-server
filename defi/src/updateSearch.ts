@@ -11,6 +11,13 @@ import { getEnv } from "./api2/env";
 import { rwaSlug } from "./rwa/utils";
 import { cachedJSONPull } from "./api2/utils/cachedFunctions";
 
+// This script builds two Meilisearch indexes:
+// - `pages`: internal DefiLlama routes shown in app/global search.
+// - `directory`: external project URLs shown in directory-style search.
+//
+// Most top-level protocol and chain entities intentionally come from
+// `/lite/protocols2`. The smol appMetadata files are used to decide which
+// metric subpages each entity should expose, not as the default entity source.
 const normalize = (str: string) => (str ? sluggifyString(str).replace(/[^a-zA-Z0-9_-]/g, "") : "");
 
 // Split camelCase/PascalCase into space-separated words: "MakerDAO" → "Maker DAO", "DexScreener" → "Dex Screener"
@@ -46,7 +53,107 @@ interface SearchResult {
   mcapRank?: number;
   previousNames?: string[];
   nameVariants?: string[];
+  keywords?: string[];
+  // Up to 5 single-value copies of `keywords`. Meilisearch's `exactness`
+  // ranking rule concatenates array attributes, so an array-valued `keywords`
+  // field can only ever produce `matchesStart` for a single-word query. By
+  // mirroring each keyword into its own scalar field at the top of
+  // `searchable-attributes`, a query matching that keyword yields
+  // `exactMatch` (score 1.0) and lets `r:desc` rank important pages above
+  // same-named entities.
+  alias1?: string;
+  alias2?: string;
+  alias3?: string;
+  alias4?: string;
+  alias5?: string;
+  r?: number;
   v: number;
+}
+
+interface TokenSearchData {
+  name: string;
+  symbol: string;
+  token_nk: string;
+  route: string;
+  is_yields: boolean;
+  mcap_rank?: number;
+  logo?: string;
+}
+
+const SEARCH_RANK = {
+  // Higher `r` wins after textual relevance. Keep navigation pages above
+  // entities for exact aliases like "yields", while subpages stay below their
+  // parent entity unless the query specifically matches the subpage text.
+  navPage: 4,
+  entity: 3,
+  collection: 2,
+  subPage: 1,
+  deprecated: -1,
+} as const;
+
+function getPageSearchKeywords(keywords?: string[]): string[] | undefined {
+  if (!Array.isArray(keywords)) return undefined;
+
+  const cleaned = Array.from(new Set(keywords.map((keyword) => keyword?.trim()).filter(Boolean)));
+  return cleaned.length > 0 ? cleaned : undefined;
+}
+
+function getPageSearchAliases(
+  keywords: string[] | undefined
+): Pick<SearchResult, "alias1" | "alias2" | "alias3" | "alias4" | "alias5"> {
+  if (!keywords?.length) return {};
+  const aliases: Record<string, string> = {};
+  for (let i = 0; i < Math.min(keywords.length, 5); i++) {
+    aliases[`alias${i + 1}`] = keywords[i];
+  }
+  return aliases;
+}
+
+function mergeKeywords(...keywordSets: Array<string[] | undefined>): string[] | undefined {
+  const merged = Array.from(
+    new Set(keywordSets.flatMap((keywords) => keywords ?? []).map((keyword) => keyword.trim()))
+  );
+  return merged.length > 0 ? merged : undefined;
+}
+
+function dedupeFrontendPageResults(results: SearchResult[]): SearchResult[] {
+  const deduped = new Map<string, SearchResult>();
+
+  for (const result of results) {
+    const dedupeKey = result.route;
+    const existing = deduped.get(dedupeKey);
+    if (!existing) {
+      deduped.set(dedupeKey, result);
+      continue;
+    }
+
+    // Two frontend pages resolve to the same route (e.g. sidebar "Stablecoins"
+    // and metric "Stablecoins by Market Cap" both point to `/stablecoins`).
+    // Collapse into one doc: keep the shorter/cleaner name for the UI, drop
+    // the longer one into `nameVariants` so it still matches at search time,
+    // and union `keywords` + recompute aliases.
+    const sameName = existing.name.trim().toLowerCase() === result.name.trim().toLowerCase();
+    const [primary, secondary] =
+      result.name.length < existing.name.length ? [result, existing] : [existing, result];
+
+    const nameVariants = sameName
+      ? mergeKeywords(existing.nameVariants, result.nameVariants)
+      : mergeKeywords(existing.nameVariants, result.nameVariants, [secondary.name]);
+    const previousNames = mergeKeywords(existing.previousNames, result.previousNames);
+    const keywords = mergeKeywords(existing.keywords, result.keywords);
+
+    deduped.set(dedupeKey, {
+      ...primary,
+      ...(keywords ? { keywords } : {}),
+      ...(previousNames ? { previousNames } : {}),
+      ...(nameVariants ? { nameVariants } : {}),
+      ...getPageSearchAliases(keywords),
+      r: Math.max(existing.r ?? 0, result.r ?? 0),
+      v: Math.max(existing.v ?? 0, result.v ?? 0),
+    });
+  }
+
+  return Array.from(deduped.values());
 }
 
 const getProtocolSubSections = ({
@@ -66,6 +173,9 @@ const getProtocolSubSections = ({
 }) => {
   const subSections: Array<SearchResult> = [];
 
+  // Protocol metadata is a capability map. If a flag exists here, the
+  // frontend has a protocol route/query state for that metric, so we add a
+  // searchable child result for it.
   if (result.tvl) {
     subSections.push({
       ...result,
@@ -275,10 +385,10 @@ const getProtocolSubSections = ({
     });
   }
 
-  return subSections.map((result) => ({
-    ...result,
-    v: tastyMetrics[result.route] ?? 0,
-    r: 0,
+  return subSections.map(({ symbol, ...rest }) => ({
+    ...rest,
+    v: tastyMetrics[rest.route] ?? 0,
+    r: rest.r === SEARCH_RANK.deprecated ? SEARCH_RANK.deprecated : SEARCH_RANK.subPage,
   }));
 };
 
@@ -305,7 +415,8 @@ async function getAllCurrentSearchResults(index: string) {
 
     allResults.push(...res.results);
 
-    // Check if we've fetched all results
+    // The delete step needs the complete current index so stale documents
+    // disappear when routes or ids are removed from this generator.
     if (res.results.length < limit || allResults.length >= res.total) {
       hasMore = false;
     } else {
@@ -335,11 +446,41 @@ for (const p of parentProtocolsList) {
   if ((p as any).previousNames?.length) previousNamesMap.set(p.name, (p as any).previousNames);
 }
 
+// Local protocol data has richer display fields than smol metadata for some
+// rows. These maps let metadata-driven fallbacks recover the canonical display
+// name and symbol without changing the main `/lite/protocols2` entity source.
+const localProtocolById = new Map<string, any>();
+const localProtocolBySlug = new Map<string, any>();
+for (const p of protocols) {
+  localProtocolById.set(p.id, p);
+  localProtocolBySlug.set(sluggifyString(p.name), p);
+}
+for (const p of parentProtocolsList) {
+  localProtocolById.set((p as any).id, p);
+  localProtocolBySlug.set(sluggifyString((p as any).name), p);
+}
+
+function getMetadataProtocolName(protocolId: string, metadata: IProtocolMetadata) {
+  if (metadata.displayName) return metadata.displayName;
+
+  const localProtocol = localProtocolById.get(protocolId);
+  if (localProtocol?.name) return localProtocol.name;
+
+  const metadataSlug = metadata.name ?? (protocolId.startsWith("chain#") ? protocolId.slice("chain#".length) : "");
+  const protocolBySlug = metadataSlug ? localProtocolBySlug.get(metadataSlug) : null;
+  if (protocolBySlug?.name) return protocolBySlug.name;
+
+  return metadataSlug;
+}
+
 function buildDirectoryResults(
   tvlData: { parentProtocols: any[]; protocols: any[] },
   parentTvl: Record<string, number>,
   tastyMetrics: Record<string, number>
 ) {
+  // Directory results are for external project URLs, not DefiLlama routes.
+  // They share much of the protocol naming/ranking data but dedupe by project
+  // URL because parent/child protocols often point to the same website.
   const otherPages = [
     { name: "LlamaFeed", route: "https://llamafeed.io" },
     { name: "Etherscan", route: "https://etherscan.io/" },
@@ -347,10 +488,11 @@ function buildDirectoryResults(
     id: `others_${normalize(page.name)}`,
     name: page.name,
     route: page.route,
+    r: SEARCH_RANK.navPage,
     v: 1000,
   })) as Array<SearchResult>;
 
-  // Deduplicate by protocol url, preferring parent protocols
+  // Deduplicate by protocol URL, preferring parent protocols.
   const stripTrailingSlash = (url: string) => url.replace(/\/+$/, "");
   const urlToIndex = new Map<string, number>();
   const directoryResults: Array<SearchResult> = [];
@@ -375,6 +517,7 @@ function buildDirectoryResults(
       ...(parent.deprecated ? { deprecated: true } : {}),
       ...(prevNames?.length ? { previousNames: [...prevNames] } : {}),
       ...(variants.length ? { nameVariants: variants } : {}),
+      r: parent.deprecated ? SEARCH_RANK.deprecated : SEARCH_RANK.entity,
       v: tastyMetrics[route] ?? 0,
     });
   }
@@ -416,6 +559,7 @@ function buildDirectoryResults(
       ...(protocol.deprecated ? { deprecated: true } : {}),
       ...(prevNames?.length ? { previousNames: [...prevNames] } : {}),
       ...(variants.length ? { nameVariants: variants } : {}),
+      r: protocol.deprecated ? SEARCH_RANK.deprecated : SEARCH_RANK.entity,
       v: tastyMetrics[route] ?? 0,
     });
   }
@@ -428,6 +572,7 @@ function buildDirectoryResults(
       ...(cex.coinSymbol ? { symbol: cex.coinSymbol } : {}),
       route: cex.url!,
       logo: `https://icons.llamao.fi/icons/protocols/${sluggifyString(cex.slug!)}?w=48&h=48`,
+      r: SEARCH_RANK.collection,
       v: tastyMetrics[`/cex/${sluggifyString(cex.slug!)}`] ?? 0,
     }));
 
@@ -444,6 +589,13 @@ function buildDirectoryResults(
 async function generateSearchList() {
   const endAt = Date.now();
   const startAt = endAt - 1000 * 60 * 60 * 24 * 90;
+  // Fetch all source datasets up front. The important split:
+  // - `/lite/protocols2` supplies protocol and parent protocol entities.
+  // - `appMetadata-chains.json` supplies chain entities and their metric pages.
+  // - `appMetadata-protocols.json` describes which metric pages exist for
+  //   protocol entities.
+  // - `pages.json` supplies static frontend navigation pages.
+  // - Tasty metrics provide recent route popularity for ranking within groups.
   const [
     tvlData,
     stablecoinsData,
@@ -468,11 +620,11 @@ async function generateSearchList() {
     },
     { peggedAssets: Array<{ name: string; symbol: string; circulating: { peggedUSD: number } }> },
     { bridges: Array<{ name: string; displayName: string; icon: string; monthlyVolume: number; slug?: string }> },
-    Record<string, Array<{ name: string; route: string }>>,
+    Record<string, Array<{ name: string; route: string; searchKeywords?: string[] }>>,
     Record<string, number>,
     Record<string, IProtocolMetadata>,
     Record<string, IChainMetadata>,
-    Array<{ symbol: string; name: string; token_nk: string; mcap_rank: number; on_yields: boolean }>,
+    Record<string, TokenSearchData>,
     {
       assetMetadata: Record<string, { name: string; ticker: string }>;
       institutionMetadata: Record<string, { name: string; ticker: string }>;
@@ -513,7 +665,7 @@ async function generateSearchList() {
     }),
     cachedJSONPull("https://api.llama.fi/config/smol/appMetadata-protocols.json"),
     cachedJSONPull("https://api.llama.fi/config/smol/appMetadata-chains.json"),
-    cachedJSONPull("https://ask.llama.fi/coins"),
+    cachedJSONPull("https://api.llama.fi/config/smol/token.json"),
     cachedJSONPull(`https://pro-api.llama.fi/${getEnv("INTERNAL_API_KEY")}/dat/institutions`),
     cachedJSONPull(`https://pro-api.llama.fi/${getEnv("INTERNAL_API_KEY")}/rwa/list`),
     cachedJSONPull({
@@ -550,6 +702,16 @@ async function generateSearchList() {
     }),
     cachedJSONPull(`https://pro-api.llama.fi/${getEnv("INTERNAL_API_KEY")}/equities/v1/companies`),
   ]);
+  if (!coinsData || Array.isArray(coinsData)) {
+    console.log("Unexpected response while reading token cache:", coinsData);
+    throw new Error("Failed to fetch token cache from https://api.llama.fi/config/smol/token.json");
+  }
+  const slugToProtocolName = new Map<string, string>();
+  for (const id in protocolsMetadata) {
+    const meta = protocolsMetadata[id];
+    if (!meta?.name || !meta?.displayName) continue;
+    slugToProtocolName.set(meta.name, meta.displayName);
+  }
   const parentTvl = {} as any;
   const chainTvl = {} as any;
   const categoryTvl = {} as any;
@@ -562,6 +724,8 @@ async function generateSearchList() {
     }
   };
   for (const p of tvlData.protocols) {
+    // Aggregate protocol TVL into the collection entities that search exposes:
+    // chains, categories, tags, and parent protocols.
     for (const chain in p.chainTvls) {
       addOrCreate(chainTvl, chain, (p.chainTvls[chain] as any).tvl);
     }
@@ -576,6 +740,13 @@ async function generateSearchList() {
 
   const protocols: Array<SearchResult> = [];
   const subProtocols: Array<SearchResult> = [];
+  const metadataChainSlugs = new Set<string>();
+  for (const chainSlug in chainsMetadata) {
+    metadataChainSlugs.add(chainSlug);
+  }
+
+  // Parent protocols are first-class protocol search results. Their child
+  // protocol names are only needed for subpage routes like grouped yields.
   for (const parent of tvlData.parentProtocols) {
     const prevNames = previousNamesMap.get(parent.name);
     const allNames = [parent.name, ...(prevNames ?? [])];
@@ -590,6 +761,7 @@ async function generateSearchList() {
       ...(parent.deprecated ? { deprecated: true, r: -1 } : {}),
       ...(prevNames?.length ? { previousNames: [...prevNames] } : {}),
       ...(variants.length ? { nameVariants: variants } : {}),
+      r: parent.deprecated ? SEARCH_RANK.deprecated : SEARCH_RANK.entity,
       v: tastyMetrics[`/protocol/${sluggifyString(parent.name)}`] ?? 0,
       type: "Protocol",
     };
@@ -609,6 +781,9 @@ async function generateSearchList() {
     subProtocols.push(...subSections);
   }
 
+  // Child protocols are also first-class protocol search results. This list is
+  // still `/lite/protocols2`, so protocols missing there are intentionally not
+  // added unless they hit the narrow `chain#` fallback below.
   for (const protocol of tvlData.protocols) {
     if (protocol.name === "LlamaSwap") continue;
     const prevNames = previousNamesMap.get(protocol.name);
@@ -624,6 +799,7 @@ async function generateSearchList() {
       ...(protocol.deprecated ? { deprecated: true, r: -1 } : {}),
       ...(prevNames?.length ? { previousNames: [...prevNames] } : {}),
       ...(variants.length ? { nameVariants: variants } : {}),
+      r: protocol.deprecated ? SEARCH_RANK.deprecated : SEARCH_RANK.entity,
       v: tastyMetrics[`/protocol/${sluggifyString(protocol.name)}`] ?? 0,
       type: "Protocol",
     };
@@ -641,23 +817,71 @@ async function generateSearchList() {
     subProtocols.push(...subSections);
   }
 
+  // Some chains are represented as protocol metadata rows named `chain#slug`
+  // because they have app-level dimensions such as fees/revenue, but they may
+  // not appear in chain app metadata. If no chain page exists, promote that
+  // `chain#` row into protocol search so users can still reach
+  // `/protocol/:chainName` and its metric subpages. Do not use this as a
+  // generic metadata-only protocol fallback.
+  for (const protocolId in protocolsMetadata) {
+    if (!protocolId.startsWith("chain#")) continue;
+    if (metadataChainSlugs.has(protocolId.slice("chain#".length))) continue;
+
+    const metadata = protocolsMetadata[protocolId];
+    const name = getMetadataProtocolName(protocolId, metadata);
+    if (!name) continue;
+
+    const prevNames = previousNamesMap.get(name);
+    const allNames = [name, ...(prevNames ?? [])];
+    const variants = buildNameVariants(allNames);
+    const symbol = localProtocolBySlug.get(sluggifyString(name))?.symbol;
+    const result = {
+      id: `protocol_${normalize(protocolId)}`,
+      name,
+      ...(symbol && symbol !== "-" ? { symbol } : {}),
+      logo: `https://icons.llamao.fi/icons/protocols/${sluggifyString(name)}?w=48&h=48`,
+      route: `/protocol/${sluggifyString(name)}`,
+      ...(prevNames?.length ? { previousNames: [...prevNames] } : {}),
+      ...(variants.length ? { nameVariants: variants } : {}),
+      r: SEARCH_RANK.entity,
+      v: tastyMetrics[`/protocol/${sluggifyString(name)}`] ?? 0,
+      type: "Protocol",
+    };
+
+    protocols.push(result);
+    subProtocols.push(
+      ...getProtocolSubSections({
+        result,
+        metadata,
+        geckoId: metadata.gecko_id ?? null,
+        tastyMetrics,
+        protocolData: { name, id: protocolId },
+      })
+    );
+  }
+
   const rwaChainsSet = new Set<string>(rwaListData.chains ?? []);
   const chains: Array<SearchResult> = [];
   const subChains: Array<SearchResult> = [];
-  for (const chain of tvlData.chains) {
+  // Chain entities come from app metadata. TVL data can enrich those rows, but
+  // absence from `/lite/protocols2.chains` should not hide chains that have
+  // valid app-level metric pages.
+  for (const chainSlug in chainsMetadata) {
+    const metadata = chainsMetadata[chainSlug];
+    const chain = metadata.name;
     const result = {
       id: `chain_${normalize(chain)}`,
       name: chain,
-      logo: `https://icons.llamao.fi/icons/chains/rsz_${sluggifyString(chain)}?w=48&h=48`,
+      logo: `https://icons.llamao.fi/icons/chains/rsz_${chainSlug}?w=48&h=48`,
       tvl: chainTvl[chain],
-      route: `/chain/${sluggifyString(chain)}`,
-      v: tastyMetrics[`/chain/${sluggifyString(chain)}`] ?? 0,
+      route: `/chain/${chainSlug}`,
+      r: SEARCH_RANK.entity,
+      v: tastyMetrics[`/chain/${chainSlug}`] ?? 0,
       type: "Chain",
     };
 
     chains.push(result);
 
-    const metadata = chainsMetadata[sluggifyString(chain)];
     const subSections: Array<SearchResult> = [];
 
     if (metadata?.stablecoins) {
@@ -894,18 +1118,34 @@ async function generateSearchList() {
       });
     }
 
-    subChains.push(...subSections.map((result) => ({ ...result, v: tastyMetrics[result.route] ?? 0, r: 0 })));
+    subChains.push(
+      ...subSections.map(({ symbol, ...rest }) => ({
+        ...rest,
+        v: tastyMetrics[rest.route] ?? 0,
+        r: SEARCH_RANK.subPage,
+      }))
+    );
   }
 
   const categories: Array<SearchResult> = [];
+  const categoriesToExclude = new Set([
+    "RWA",
+    "RWA Perps",
+    "Dex Aggregator",
+    "Bridge Aggregator",
+    "Perp Aggregator",
+    "Derivatives",
+    "Liquidations",
+  ]);
 
   for (const category in categoryTvl) {
-    if (category === "RWA") continue;
+    if (categoriesToExclude.has(category)) continue;
     categories.push({
       id: `category_${normalize(category)}`,
       name: category,
       tvl: categoryTvl[category],
       route: `/protocols/${sluggifyString(category)}`,
+      r: SEARCH_RANK.collection,
       v: tastyMetrics[`/protocols/${sluggifyString(category)}`] ?? 0,
       type: "Category",
     });
@@ -919,6 +1159,7 @@ async function generateSearchList() {
       name: tag,
       tvl: tagTvl[tag],
       route: `/protocols/${sluggifyString(tag)}`,
+      r: SEARCH_RANK.collection,
       v: tastyMetrics[`/protocols/${sluggifyString(tag)}`] ?? 0,
       type: "Tag",
     });
@@ -931,6 +1172,7 @@ async function generateSearchList() {
     mcap: stablecoin.circulating.peggedUSD,
     logo: `https://icons.llamao.fi/icons/pegged/${sluggifyString(stablecoin.name)}?w=48&h=48`,
     route: `/stablecoin/${sluggifyString(stablecoin.name)}`,
+    r: SEARCH_RANK.entity,
     v: tastyMetrics[`/stablecoin/${sluggifyString(stablecoin.name)}`] ?? 0,
     type: "Stablecoin",
   }));
@@ -944,41 +1186,66 @@ async function generateSearchList() {
       volume: brg.monthlyVolume,
       logo: `https://icons.llamao.fi/icons/protocols/${brg.icon.split(":")[1]}?w=48&h=48`,
       route: `/bridge/${brg.slug ?? sluggifyString(brg.displayName ?? brg.name)}`,
+      r: SEARCH_RANK.entity,
       v: tastyMetrics[`/bridge/${brg.slug}`] ?? 0,
       type: "Bridge",
     });
   }
 
-  const metrics: Array<SearchResult> = (frontendPages["Metrics"] ?? []).map((i) => ({
-    id: `metric_${normalize(i.name)}`,
-    name: i.name,
-    route: i.route,
-    v: tastyMetrics[i.route] ?? 0,
-    type: "Metric",
-  }));
+  // Frontend pages are static navigation/search shortcuts. They can have
+  // keyword aliases, and duplicate routes are collapsed below.
+  let metrics: Array<SearchResult> = (frontendPages["Metrics"] ?? []).map((i) => {
+    const keywords = getPageSearchKeywords(i.searchKeywords);
+    return {
+      id: `metric_${normalize(i.name)}`,
+      name: i.name,
+      route: i.route,
+      ...(keywords ? { keywords } : {}),
+      ...getPageSearchAliases(keywords),
+      r: SEARCH_RANK.navPage,
+      v: tastyMetrics[i.route] ?? 0,
+      type: "Metric",
+    };
+  });
 
-  const tools: Array<SearchResult> = (frontendPages["Tools"] ?? []).map((t) => ({
-    id: `tool_${normalize(t.name)}`,
-    name: t.name,
-    route: t.route,
-    v: tastyMetrics[t.route] ?? 0,
-    type: "Tool",
-  }));
+  let tools: Array<SearchResult> = (frontendPages["Tools"] ?? []).map((t) => {
+    const keywords = getPageSearchKeywords(t.searchKeywords);
+    return {
+      id: `tool_${normalize(t.name)}`,
+      name: t.name,
+      route: t.route,
+      ...(keywords ? { keywords } : {}),
+      ...getPageSearchAliases(keywords),
+      r: SEARCH_RANK.navPage,
+      v: tastyMetrics[t.route] ?? 0,
+      type: "Tool",
+    };
+  });
 
-  const otherPages: Array<SearchResult> = [];
+  let otherPages: Array<SearchResult> = [];
   for (const category in frontendPages) {
     if (["Metrics", "Tools"].includes(category)) continue;
     for (const page of frontendPages[category]) {
+      const keywords = getPageSearchKeywords(page.searchKeywords);
       otherPages.push({
         id: `others_${normalize(page.name)}`,
         name: page.name,
         route: page.route,
+        ...(keywords ? { keywords } : {}),
+        ...getPageSearchAliases(keywords),
+        r: SEARCH_RANK.navPage,
         v: tastyMetrics[page.route] ?? 0,
         type: "Others",
         hideType: true,
       });
     }
   }
+
+  const dedupedFrontendPages = dedupeFrontendPageResults([...metrics, ...tools, ...otherPages]);
+  metrics = dedupedFrontendPages.filter((page) => page.type === "Metric");
+  tools = dedupedFrontendPages.filter((page) => page.type === "Tool");
+  otherPages = dedupedFrontendPages.filter((page) => page.type === "Others");
+
   const cexs: Array<SearchResult> = cexsData
     .filter((c) => c.slug)
     .map((c) => ({
@@ -986,32 +1253,24 @@ async function generateSearchList() {
       name: c.name,
       route: `/cex/${sluggifyString(c.slug!)}`,
       logo: `https://icons.llamao.fi/icons/protocols/${sluggifyString(c.slug!)}?w=48&h=48`,
+      r: SEARCH_RANK.collection,
       v: tastyMetrics[`/cex/${sluggifyString(c.slug!)}`] ?? 0,
       type: "CEX",
     }));
 
   const coins: Array<SearchResult> = [];
-  for (const coin of coinsData) {
+  for (const tokenKey in coinsData) {
+    const coin = coinsData[tokenKey];
     coins.push({
-      id: `${coin.token_nk.replace(/[^a-zA-Z0-9_-]/g, "_")}_token_usage`,
+      id: `${coin.token_nk.replace(/[^a-zA-Z0-9_-]/g, "_")}_token`,
       name: coin.symbol,
-      subName: "Token Usage",
-      route: `/token-usage?token=${coin.symbol}`,
+      route: `/token/${encodeURIComponent(coin.symbol)}`,
+      ...(coin.logo ? { logo: coin.logo } : {}),
       mcapRank: coin.mcap_rank ?? 0,
-      v: tastyMetrics[`/token-usage?token=${coin.symbol}`] ?? 0,
-      type: "Token Usage",
+      r: SEARCH_RANK.subPage,
+      v: tastyMetrics[`/token/${coin.symbol}`] ?? 0,
+      type: "Token",
     });
-    if (coin.on_yields) {
-      coins.push({
-        id: `${coin.token_nk.replace(/[^a-zA-Z0-9_-]/g, "_")}_token_yields`,
-        name: coin.symbol,
-        subName: "Token Yields",
-        route: `/yields?token=${coin.symbol}`,
-        mcapRank: coin.mcap_rank ?? 0,
-        v: tastyMetrics[`/yields?token=${coin.symbol}`] ?? 0,
-        type: "Token Yields",
-      });
-    }
   }
 
   const dats: Array<SearchResult> = [];
@@ -1021,6 +1280,7 @@ async function generateSearchList() {
       name: datsData.assetMetadata[asset].name,
       symbol: datsData.assetMetadata[asset].ticker,
       route: `/digital-asset-treasuries/${asset}`,
+      r: SEARCH_RANK.collection,
       v: tastyMetrics[`/digital-asset-treasuries/${asset}`] ?? 0,
       type: "DAT",
     });
@@ -1031,6 +1291,7 @@ async function generateSearchList() {
       name: datsData.institutionMetadata[institution].name,
       symbol: datsData.institutionMetadata[institution].ticker,
       route: `/digital-asset-treasury/${sluggifyString(datsData.institutionMetadata[institution].ticker)}`,
+      r: SEARCH_RANK.collection,
       v:
         tastyMetrics[`/digital-asset-treasury/${sluggifyString(datsData.institutionMetadata[institution].ticker)}`] ??
         0,
@@ -1045,6 +1306,7 @@ async function generateSearchList() {
       id: `rwa_asset_${normalize(canonicalMarketId)}`,
       ...(name ? { name, symbol: canonicalMarketId } : { name: canonicalMarketId }),
       route: `/rwa/asset/${encodedCanonicalMarketId}`,
+      r: SEARCH_RANK.collection,
       v: tastyMetrics[`/rwa/asset/${encodedCanonicalMarketId}`] ?? 0,
       type: "RWA",
     });
@@ -1055,6 +1317,7 @@ async function generateSearchList() {
       id: `rwa_platform_${normalize(platformSlug)}`,
       name: platform,
       route: `/rwa/platform/${platformSlug}`,
+      r: SEARCH_RANK.collection,
       v: tastyMetrics[`/rwa/platform/${platformSlug}`] ?? 0,
       type: "RWA",
     });
@@ -1066,6 +1329,7 @@ async function generateSearchList() {
       id: `rwa_category_${normalize(categorySlug)}`,
       name: category,
       route: `/rwa/category/${categorySlug}`,
+      r: SEARCH_RANK.collection,
       v: tastyMetrics[`/rwa/category/${categorySlug}`] ?? 0,
       type: "RWA",
     });
@@ -1078,6 +1342,7 @@ async function generateSearchList() {
       id: `rwa_perps_contract_${normalize(contract)}`,
       name: name,
       route: `/rwa/perps/contract/${encodeURIComponent(contract)}`,
+      r: SEARCH_RANK.collection,
       v: tastyMetrics[`/rwa/perps/contract/${encodeURIComponent(contract)}`] ?? 0,
       type: "RWA Perps",
     });
@@ -1087,6 +1352,7 @@ async function generateSearchList() {
       id: `rwa_perps_venue_${normalize(venue)}`,
       name: venue,
       route: `/rwa/perps/venue/${rwaSlug(venue)}`,
+      r: SEARCH_RANK.collection,
       v: tastyMetrics[`/rwa/perps/venue/${rwaSlug(venue)}`] ?? 0,
       type: "RWA Perps",
     });
@@ -1096,6 +1362,7 @@ async function generateSearchList() {
       id: `rwa_perps_asset_group_${normalize(assetGroup)}`,
       name: assetGroup,
       route: `/rwa/perps/asset-group/${rwaSlug(assetGroup)}`,
+      r: SEARCH_RANK.collection,
       v: tastyMetrics[`/rwa/perps/asset-group/${rwaSlug(assetGroup)}`] ?? 0,
       type: "RWA Perps",
     });
@@ -1106,11 +1373,14 @@ async function generateSearchList() {
     symbol: equity.ticker,
     logo: `https://icons.llamao.fi/icons/equities/${equity.ticker}?w=48&h=48`,
     route: `/equities/${equity.ticker.toLowerCase()}`,
+    r: SEARCH_RANK.collection,
     v: tastyMetrics[`/equities/${equity.ticker.toLowerCase()}`] ?? 0,
     type: "Equities",
   }));
 
   const sortDesc = (a: any, b: any) => (b.v ?? 0) - (a.v ?? 0);
+  // Sort each visible group by recent route popularity before concatenating.
+  // Cross-group ordering is mostly controlled by Meilisearch relevance + `r`.
   const sortedGroups = [
     chains,
     protocols,
@@ -1130,6 +1400,8 @@ async function generateSearchList() {
   for (const group of sortedGroups) group.sort(sortDesc);
 
   return {
+    // The pages index contains entities, frontend pages, metric subpages, and
+    // long-tail token/RWA/equity routes.
     results: [
       ...chains,
       ...protocols,
@@ -1153,6 +1425,8 @@ async function generateSearchList() {
       r: result.r ?? 1,
     })),
     directoryResults: buildDirectoryResults(tvlData, parentTvl, tastyMetrics),
+    // `searchlist.json` is a small popular-results fallback, not the complete
+    // search corpus.
     topResults: [chains, protocols, stablecoins, metrics, categories, tools, tags]
       .flatMap((g) => g.slice(0, 3))
       .map((r) => ({ ...r, v: 0 })),

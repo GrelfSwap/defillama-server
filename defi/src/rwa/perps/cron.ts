@@ -18,7 +18,7 @@ import {
     fetchMaxUpdatedAtPG,
     fetchAllDailyIdsPG,
 } from './db';
-import { toFiniteNumberOrZero, groupBy } from './utils';
+import { getPercentChangeOrNull, toFiniteNumberOrZero, groupBy } from './utils';
 import { main as runPipeline } from './perps';
 import {
     buildCategoryHistoricalCharts,
@@ -27,7 +27,7 @@ import {
     buildPerpsIdMap,
     buildVenueHistoricalCharts
 } from './aggregate';
-import { normalizePerpsMetadataInPlace } from './constants';
+import { normalizePerpsMetadataInPlace, hasContractMetadata } from './constants';
 import { buildPerpsList } from './list';
 import { normalizePerpsAssetGroup, sortPerpsMarketsByOpenInterest } from './server-helpers';
 
@@ -44,7 +44,9 @@ async function generateCurrentData(metadata: PerpsMetadata[]): Promise<any[]> {
     const metadataMap = new Map<string, any>();
     metadata.forEach((m) => metadataMap.set(m.id, m.data));
 
-    const result = sortPerpsMarketsByOpenInterest(currentData.map((record: any) => {
+    const result = sortPerpsMarketsByOpenInterest(currentData
+        .filter((record: any) => metadataMap.has(record.id))
+        .map((record: any) => {
         const meta = metadataMap.get(record.id) || {};
         const merged = {
             ...(record.data || {}),
@@ -56,9 +58,15 @@ async function generateCurrentData(metadata: PerpsMetadata[]): Promise<any[]> {
             id: record.id,
             timestamp: record.timestamp,
             openInterest: toFiniteNumberOrZero(record.open_interest),
+            openInterestChange24h: record.is_latest_current
+                ? getPercentChangeOrNull(record.open_interest, record.prev_open_interest)
+                : null,
             volume24h: toFiniteNumberOrZero(record.volume_24h),
+            volume24hChange24h: record.is_latest_current
+                ? getPercentChangeOrNull(record.volume_24h, record.prev_volume_24h)
+                : null,
             price: toFiniteNumberOrZero(record.price),
-            priceChange24h: toFiniteNumberOrZero(record.price_change_24h),
+            priceChange24h: record.is_latest_current ? getPercentChangeOrNull(record.price, record.prev_price) : null,
             fundingRate: toFiniteNumberOrZero(record.funding_rate),
             premium: toFiniteNumberOrZero(record.premium),
             cumulativeFunding: toFiniteNumberOrZero(record.cumulative_funding),
@@ -168,6 +176,9 @@ async function generateHistoricalCharts(): Promise<void> {
     let processedCount = 0;
 
     for (const id in recordsById) {
+        // Skip delisted/unknown markets — keeps their per-ID chart file stale
+        // but prevents new data from being appended.
+        if (!hasContractMetadata(id)) continue;
         const records = recordsById[id];
         const newData = records.map((r: any) => ({
             timestamp: r.timestamp,
@@ -270,9 +281,12 @@ async function cron(): Promise<void> {
     console.log('[rwa-perps-cron] Running data pipeline...');
     await runPipeline();
 
-    // 3. Fetch metadata
-    const metadata = await fetchMetadataPG();
-    console.log(`[rwa-perps-cron] Loaded ${metadata.length} metadata records`);
+    // 3. Fetch metadata — runPipeline() above re-loaded CONTRACT_METADATA from Airtable,
+    //    so `hasContractMetadata` excludes both unknown and delisted contracts.
+    const allMetadata = await fetchMetadataPG();
+    const metadata = allMetadata.filter((m: any) => hasContractMetadata(m.id));
+    const excludedCount = allMetadata.length - metadata.length;
+    console.log(`[rwa-perps-cron] Loaded ${metadata.length} metadata records (excluded ${excludedCount} delisted/unknown)`);
 
     // 4. Generate cache files
     const currentData = await generateCurrentData(metadata);
